@@ -1,9 +1,9 @@
 // BD COMMAND CENTER — service worker.
 // Кэширует только оболочку приложения и шрифты. Данные из базы сюда не попадают:
 // запросы к Apps Script всегда идут в сеть.
-const VERSION = 'bd-shell-v1';
+const VERSION = 'bd-shell-v2';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.webmanifest',
-  'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
+  'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
