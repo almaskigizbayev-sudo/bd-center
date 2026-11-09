@@ -1,0 +1,1844 @@
+/* BD COMMAND CENTER — весь серверный код одним файлом. Вставить целиком в редактор Apps Script. */
+
+/* ======================== Schema ======================== */
+/**
+ * BD COMMAND CENTER — Schema.gs
+ * Единственный источник правды о структуре данных.
+ * Из этого описания Setup.gs создаёт листы, а Db.gs валидирует записи.
+ *
+ * Типы полей:
+ *   id, text, longtext, number, money, percent, date, datetime, bool, url,
+ *   email, phone, json,
+ *   enum:<LIST>   — значение из ReferenceData (list_name = LIST)
+ *   ref:<Table>   — ID одной записи таблицы
+ *   refs:<Table>  — несколько ID через запятую
+ *   multi:<LIST>  — несколько кодов справочника через запятую
+ */
+
+var DIRECTIONS = [
+  { code: 'FDY', name: 'Литейный завод',              name_en: 'Foundry',                 prefix: 'F_', folder: '01_FOUNDRY',                  color: '#3A3F47', order: 1 },
+  { code: 'AGR', name: 'Агробизнес',                  name_en: 'Agribusiness',            prefix: 'A_', folder: '02_AGRIBUSINESS',             color: '#4B6B3C', order: 2 },
+  { code: 'WHL', name: 'Склады и логистика',          name_en: 'Warehousing & Logistics', prefix: 'W_', folder: '03_WAREHOUSING_LOGISTICS',    color: '#4A5A78', order: 3 },
+  { code: 'WLF', name: 'Федерация тяжёлой атлетики',  name_en: 'Weightlifting Federation', prefix: 'S_', folder: '04_WEIGHTLIFTING_FEDERATION', color: '#7A4B3A', order: 4 }
+];
+
+/** Поля, которые автоматически добавляются в каждую НЕ системную таблицу. */
+var COMMON_FIELDS = [
+  ['id',          'id',       'Уникальный ID, формат PFX-YYMMDD-XXXXXX'],
+  ['created_at',  'datetime', 'Дата создания'],
+  ['updated_at',  'datetime', 'Дата последнего изменения'],
+  ['status',      'text',     'Статус записи (значения зависят от таблицы)'],
+  ['direction',   'multi:DIRECTION', 'Направление(я): FDY, AGR, WHL, WLF'],
+  ['owner',       'email',    'Ответственный'],
+  ['source',      'text',     'Происхождение: manual / import:<batch_id> / ai / telegram / calendar'],
+  ['rev',         'number',   'Версия записи для защиты от одновременной перезаписи'],
+  ['deleted_at',  'datetime', 'Дата архивации (физически не удаляем)']
+];
+
+var TABLES = {
+
+  /* ======================== ОБЩИЕ ТАБЛИЦЫ ======================== */
+
+  Companies: {
+    prefix: 'CMP', group: 'common',
+    desc: 'Все организации: заказчики, поставщики, партнёры, спонсоры, арендаторы. Одна компания = одна запись, даже если она в нескольких направлениях.',
+    statuses: ['active', 'prospect', 'inactive', 'archived'],
+    fields: [
+      ['name',          'text',     'Короткое название (как называем в работе)'],
+      ['legal_name',    'text',     'Юридическое название'],
+      ['name_norm',     'text',     'Нормализованное имя для поиска дублей (заполняется автоматически)'],
+      ['tax_id',        'text',     'БИН / ИНН / регистрационный номер'],
+      ['country',       'enum:COUNTRY', 'Страна'],
+      ['region',        'text',     'Область / регион'],
+      ['city',          'text',     'Город'],
+      ['industry',      'multi:INDUSTRY', 'Отрасль(и)'],
+      ['roles',         'multi:COMPANY_ROLE', 'Роли: customer, supplier, partner, sponsor, tenant, logistics, investor, government, media'],
+      ['website',       'url',      'Сайт'],
+      ['phone',         'phone',    'Общий телефон'],
+      ['email',         'email',    'Общий email'],
+      ['address',       'longtext', 'Адрес'],
+      ['size',          'enum:COMPANY_SIZE', 'Размер'],
+      ['verification',  'enum:VERIFICATION', 'verified / unverified / unknown — проверены ли данные'],
+      ['priority',      'enum:PRIORITY', 'P1 / P2 / P3'],
+      ['tags',          'text',     'Свободные теги через запятую'],
+      ['drive_folder_id','text',    'Папка компании в Drive (создаётся при первом документе)'],
+      ['last_touch_at', 'datetime', 'Последнее взаимодействие (автоматически)'],
+      ['next_touch_at', 'datetime', 'Запланированный следующий контакт'],
+      ['notes',         'longtext', 'Заметки']
+    ]
+  },
+
+  Contacts: {
+    prefix: 'CNT', group: 'common',
+    desc: 'Люди. Привязаны к компании, но могут существовать без неё (тренер, журналист).',
+    statuses: ['active', 'left_company', 'do_not_contact', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['full_name',     'text',     'ФИО'],
+      ['position',      'text',     'Должность'],
+      ['department',    'text',     'Отдел'],
+      ['decision_role', 'enum:DECISION_ROLE', 'decision_maker / influencer / procurement / technical / user / other'],
+      ['phone',         'phone',    'Телефон'],
+      ['email',         'email',    'Email'],
+      ['telegram',      'text',     'Telegram'],
+      ['whatsapp',      'phone',    'WhatsApp'],
+      ['language',      'enum:LANGUAGE', 'Язык общения'],
+      ['verification',  'enum:VERIFICATION', 'Проверены ли данные'],
+      ['last_touch_at', 'datetime', 'Последний контакт (автоматически)'],
+      ['next_touch_at', 'datetime', 'Следующий контакт'],
+      ['notes',         'longtext', 'Заметки']
+    ]
+  },
+
+  BusinessDirections: {
+    prefix: 'DIR', group: 'system', system: true,
+    desc: 'Справочник четырёх направлений. Новые направления не добавляются без изменения кода.',
+    fields: [
+      ['code',          'text',     'FDY / AGR / WHL / WLF'],
+      ['name',          'text',     'Название'],
+      ['name_en',       'text',     'Название EN'],
+      ['table_prefix',  'text',     'Префикс специализированных таблиц'],
+      ['color',         'text',     'Цвет в интерфейсе'],
+      ['sort_order',    'number',   'Порядок'],
+      ['drive_folder_id','text',    'Папка в Drive'],
+      ['active',        'bool',     'Активно']
+    ]
+  },
+
+  Projects: {
+    prefix: 'PRJ', group: 'common',
+    desc: 'Проекты внутри направления: крупная сделка, запуск склада, чемпионат, агропроект.',
+    statuses: ['idea', 'planning', 'active', 'on_hold', 'done', 'cancelled', 'archived'],
+    fields: [
+      ['name',          'text',     'Название'],
+      ['company_id',    'ref:Companies', 'Основная компания (если есть)'],
+      ['description',   'longtext', 'Описание и цель'],
+      ['priority',      'enum:PRIORITY', 'Приоритет'],
+      ['value_amount',  'money',    'Оценка ценности / бюджета'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['start_date',    'date',     'Начало'],
+      ['due_date',      'date',     'Срок'],
+      ['health',        'enum:HEALTH', 'green / yellow / red — состояние'],
+      ['blocker',       'longtext', 'Что блокирует'],
+      ['drive_folder_id','text',    'Папка проекта']
+    ]
+  },
+
+  Tasks: {
+    prefix: 'TSK', group: 'common',
+    desc: 'Любое действие с ответственным и сроком, включая звонки.',
+    statuses: ['todo', 'in_progress', 'waiting', 'done', 'cancelled', 'archived'],
+    fields: [
+      ['title',         'text',     'Что сделать'],
+      ['description',   'longtext', 'Детали'],
+      ['task_type',     'enum:TASK_TYPE', 'task / call / email / visit / document / followup'],
+      ['priority',      'enum:PRIORITY', 'P1 / P2 / P3'],
+      ['due_at',        'datetime', 'Срок'],
+      ['remind_at',     'datetime', 'Напомнить'],
+      ['waiting_for',   'text',     'Чего / кого ждём (для статуса waiting)'],
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['contact_id',    'ref:Contacts',  'Контакт'],
+      ['project_id',    'ref:Projects',  'Проект'],
+      ['related_type',  'text',     'Тип связанной записи (F_Quotes, Meetings…)'],
+      ['related_id',    'text',     'ID связанной записи'],
+      ['completed_at',  'datetime', 'Когда выполнено']
+    ]
+  },
+
+  Meetings: {
+    prefix: 'MTG', group: 'common',
+    desc: 'Встречи и созвоны. Синхронизируются с Google Calendar.',
+    statuses: ['planned', 'confirmed', 'done', 'cancelled', 'rescheduled', 'archived'],
+    fields: [
+      ['title',         'text',     'Тема'],
+      ['meeting_type',  'enum:MEETING_TYPE', 'meeting / call / video / site_visit / event'],
+      ['start_at',      'datetime', 'Начало'],
+      ['end_at',        'datetime', 'Окончание'],
+      ['location',      'text',     'Место / ссылка'],
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['contact_ids',   'refs:Contacts', 'Участники'],
+      ['project_id',    'ref:Projects',  'Проект'],
+      ['goal',          'longtext', 'Цель встречи'],
+      ['outcome',       'longtext', 'Итог'],
+      ['calendar_event_id','text',  'ID события Google Calendar'],
+      ['protocol_doc_id','text',    'Протокол в Google Docs'],
+      ['reminder_sent_at','datetime','Когда отправлено напоминание (защита от дублей)']
+    ]
+  },
+
+  Agreements: {
+    prefix: 'AGM', group: 'common',
+    desc: 'Договорённости: кто кому что обещал и к какому сроку. Главная защита от «забыл».',
+    statuses: ['open', 'fulfilled', 'overdue', 'broken', 'cancelled', 'archived'],
+    fields: [
+      ['description',   'longtext', 'Суть договорённости'],
+      ['who_owes',      'enum:AGREEMENT_SIDE', 'me / them / both — кто должен выполнить'],
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['contact_id',    'ref:Contacts',  'Контакт'],
+      ['project_id',    'ref:Projects',  'Проект'],
+      ['meeting_id',    'ref:Meetings',  'На какой встрече договорились'],
+      ['due_at',        'datetime', 'Срок'],
+      ['amount',        'money',    'Сумма, если есть'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['confirmed',     'bool',     'Подтверждено второй стороной письменно'],
+      ['evidence',      'longtext', 'Где зафиксировано (письмо, протокол, сообщение)']
+    ]
+  },
+
+  Opportunities: {
+    prefix: 'OPP', group: 'common',
+    desc: 'Коммерческие возможности (сделки) во всех направлениях. Этапы задаются по направлению.',
+    statuses: ['open', 'won', 'lost', 'on_hold', 'archived'],
+    fields: [
+      ['title',         'text',     'Название'],
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['contact_id',    'ref:Contacts',  'Основной контакт'],
+      ['project_id',    'ref:Projects',  'Проект'],
+      ['stage',         'enum:OPP_STAGE', 'Этап (список зависит от направления)'],
+      ['amount',        'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['probability',   'percent',  'Вероятность, % (вводится вручную, не AI)'],
+      ['expected_close','date',     'Ожидаемое закрытие'],
+      ['next_step',     'text',     'Следующий шаг'],
+      ['next_step_at',  'datetime', 'Когда'],
+      ['lost_reason',   'text',     'Причина проигрыша']
+    ]
+  },
+
+  Suppliers: {
+    prefix: 'SUP', group: 'common',
+    desc: 'Расширение карточки компании с ролью «поставщик». Данные компании не дублируются.',
+    statuses: ['active', 'qualified', 'candidate', 'blocked', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['supply_category','text',    'Что поставляет'],
+      ['payment_terms', 'text',     'Условия оплаты'],
+      ['lead_time_days','number',   'Типичный срок поставки, дней'],
+      ['rating',        'enum:RATING', '1–5, ставится вручную'],
+      ['notes',         'longtext', 'Заметки']
+    ]
+  },
+
+  Customers: {
+    prefix: 'CUS', group: 'common',
+    desc: 'Расширение карточки компании с ролью «заказчик».',
+    statuses: ['prospect', 'first_contact', 'qualified', 'active', 'lost', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['segment',       'text',     'Сегмент'],
+      ['potential_amount','money',  'Потенциал в год (оценка)'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['payment_terms', 'text',     'Условия оплаты'],
+      ['first_order_at','date',     'Первый заказ'],
+      ['notes',         'longtext', 'Заметки']
+    ]
+  },
+
+  Documents: {
+    prefix: 'DOC', group: 'common',
+    desc: 'Реестр документов. Файл в Drive, здесь ссылка и связи.',
+    statuses: ['draft', 'final', 'sent', 'signed', 'superseded', 'archived'],
+    fields: [
+      ['title',         'text',     'Название'],
+      ['doc_type',      'enum:DOC_TYPE', 'rfq / quote / contract / protocol / drawing / spec / invoice / presentation / report / other'],
+      ['drive_file_id', 'text',     'ID файла в Drive'],
+      ['url',           'url',      'Ссылка'],
+      ['mime_type',     'text',     'Тип файла'],
+      ['company_id',    'ref:Companies', 'Компания'],
+      ['project_id',    'ref:Projects',  'Проект'],
+      ['related_type',  'text',     'Связанная таблица'],
+      ['related_id',    'text',     'Связанная запись'],
+      ['version',       'number',   'Версия'],
+      ['sent_at',       'datetime', 'Когда отправлен']
+    ]
+  },
+
+  Notes: {
+    prefix: 'NTE', group: 'common',
+    desc: 'Быстрые заметки, привязанные к чему угодно.',
+    statuses: ['active', 'archived'],
+    fields: [
+      ['body',          'longtext', 'Текст'],
+      ['related_type',  'text',     'Связанная таблица'],
+      ['related_id',    'text',     'Связанная запись'],
+      ['pinned',        'bool',     'Закреплена']
+    ]
+  },
+
+  Notifications: {
+    prefix: 'NTF', group: 'system',
+    desc: 'Журнал уведомлений и защита от дублей.',
+    statuses: ['scheduled', 'sent', 'failed', 'skipped'],
+    fields: [
+      ['channel',       'text',     'telegram / email / push'],
+      ['notif_type',    'text',     'morning / evening / pre_meeting / followup / overdue / error'],
+      ['dedupe_key',    'text',     'тип:ID:дата — одно и то же не отправляется дважды'],
+      ['related_type',  'text',     'Связанная таблица'],
+      ['related_id',    'text',     'Связанная запись'],
+      ['text_preview',  'longtext', 'Начало текста'],
+      ['scheduled_at',  'datetime', 'Когда планировалось'],
+      ['sent_at',       'datetime', 'Когда отправлено'],
+      ['error',         'longtext', 'Ошибка']
+    ]
+  },
+
+  ActivityLog: {
+    prefix: 'ACT', group: 'system',
+    desc: 'Журнал всех изменений. Только добавление строк.',
+    statuses: ['ok', 'error'],
+    fields: [
+      ['actor',         'text',     'owner / ai / system / telegram / import'],
+      ['action',        'text',     'create / update / archive / restore / import / send / error / login'],
+      ['entity_type',   'text',     'Таблица'],
+      ['entity_id',     'text',     'ID записи'],
+      ['diff_json',     'json',     'Что изменилось: {поле: [было, стало]}'],
+      ['confirmed_by',  'email',    'Кто подтвердил действие, предложенное AI'],
+      ['note',          'longtext', 'Комментарий / текст ошибки']
+    ]
+  },
+
+  AIHistory: {
+    prefix: 'AIH', group: 'system',
+    desc: 'История запросов к AI, использованные записи и расход токенов.',
+    statuses: ['ok', 'error'],
+    fields: [
+      ['channel',       'text',     'web / telegram / job'],
+      ['prompt',        'longtext', 'Запрос'],
+      ['response',      'longtext', 'Ответ (обрезается до 20 000 символов)'],
+      ['tools_used',    'json',     'Какие инструменты вызывались'],
+      ['records_cited', 'text',     'ID записей, на которые опирается ответ'],
+      ['model',         'text',     'Модель'],
+      ['tokens_in',     'number',   'Токены на входе'],
+      ['tokens_out',    'number',   'Токены на выходе'],
+      ['duration_ms',   'number',   'Время ответа']
+    ]
+  },
+
+  ImportBatches: {
+    prefix: 'IMP', group: 'system',
+    desc: 'Каждый импорт: откуда, сколько строк, сколько дублей. Позволяет откатить импорт.',
+    statuses: ['preview', 'done', 'rolled_back', 'failed'],
+    fields: [
+      ['file_name',     'text',     'Имя исходного файла'],
+      ['drive_file_id', 'text',     'Исходник в Drive'],
+      ['target_tables', 'text',     'Куда импортировано'],
+      ['rows_total',    'number',   'Строк в файле'],
+      ['rows_created',  'number',   'Создано записей'],
+      ['rows_merged',   'number',   'Слито с существующими'],
+      ['rows_skipped',  'number',   'Пропущено'],
+      ['report_json',   'json',     'Детали по строкам']
+    ]
+  },
+
+  Settings: {
+    prefix: 'SET', group: 'system', system: true,
+    desc: 'Настройки, которые меняются без кода. Секреты здесь НЕ хранятся.',
+    fields: [
+      ['key',           'text',     'Ключ'],
+      ['value',         'text',     'Значение'],
+      ['value_type',    'text',     'string / number / bool / time / json'],
+      ['description',   'text',     'Что это']
+    ]
+  },
+
+  ReferenceData: {
+    prefix: 'REF', group: 'system', system: true,
+    desc: 'Все выпадающие списки. Новый пункт = новая строка, код не трогаем.',
+    fields: [
+      ['list_name',     'text',     'Имя списка (INDUSTRY, COUNTRY, OPP_STAGE…)'],
+      ['code',          'text',     'Код значения'],
+      ['label_ru',      'text',     'Подпись RU'],
+      ['label_en',      'text',     'Подпись EN'],
+      ['direction',     'text',     'Если список зависит от направления'],
+      ['sort_order',    'number',   'Порядок'],
+      ['active',        'bool',     'Активно']
+    ]
+  },
+
+  /* ======================== ЛИТЕЙНЫЙ ЗАВОД (F_) ======================== */
+
+  F_Products: {
+    prefix: 'FPR', group: 'FDY',
+    desc: 'Номенклатура: что завод может отлить. Цены и материалы заполняются только из подтверждённых данных завода.',
+    statuses: ['active', 'development', 'discontinued', 'archived'],
+    fields: [
+      ['name',          'text',     'Наименование'],
+      ['category',      'enum:F_PRODUCT_CATEGORY', 'Категория'],
+      ['material_grade','text',     'Марка материала'],
+      ['weight_kg',     'number',   'Масса, кг'],
+      ['drawing_doc_id','ref:Documents', 'Чертёж'],
+      ['fits_equipment','text',     'Для какого оборудования'],
+      ['base_price',    'money',    'Базовая цена'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['lead_time_days','number',   'Срок изготовления, дней'],
+      ['notes',         'longtext', 'Примечания']
+    ]
+  },
+
+  F_RFQ: {
+    prefix: 'FRQ', group: 'FDY',
+    desc: 'Входящие запросы на расчёт.',
+    statuses: ['new', 'clarifying', 'costing', 'quoted', 'won', 'lost', 'no_bid', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Заказчик'],
+      ['contact_id',    'ref:Contacts',  'Кто прислал'],
+      ['opportunity_id','ref:Opportunities', 'Сделка'],
+      ['received_at',   'datetime', 'Получен'],
+      ['items_summary', 'longtext', 'Что просят (позиции, кол-во)'],
+      ['drawing_doc_ids','refs:Documents', 'Чертежи / ТЗ'],
+      ['required_by',   'date',     'Нужно к дате'],
+      ['delivery_place','text',     'Куда поставка'],
+      ['quote_due_at',  'datetime', 'Когда обещали ответить с КП'],
+      ['no_bid_reason', 'text',     'Почему не взяли']
+    ]
+  },
+
+  F_Costing: {
+    prefix: 'FCS', group: 'FDY',
+    desc: 'Расчёт себестоимости и цены по позиции. Формулы задаются на листе, AI их не меняет.',
+    statuses: ['draft', 'approved', 'superseded', 'archived'],
+    fields: [
+      ['rfq_id',        'ref:F_RFQ', 'Запрос'],
+      ['product_id',    'ref:F_Products', 'Позиция (если есть в номенклатуре)'],
+      ['item_name',     'text',     'Позиция'],
+      ['quantity',      'number',   'Количество, шт'],
+      ['weight_kg',     'number',   'Масса единицы, кг'],
+      ['material_cost', 'money',    'Металл на единицу'],
+      ['casting_cost',  'money',    'Литьё на единицу'],
+      ['machining_cost','money',    'Мехобработка на единицу'],
+      ['heat_treat_cost','money',   'Термообработка на единицу'],
+      ['overhead_cost', 'money',    'Накладные на единицу'],
+      ['logistics_cost','money',    'Логистика на единицу'],
+      ['unit_cost',     'money',    'Себестоимость единицы'],
+      ['margin_pct',    'percent',  'Наценка, %'],
+      ['unit_price',    'money',    'Цена единицы'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['approved_by',   'email',    'Кто утвердил цену']
+    ]
+  },
+
+  F_Quotes: {
+    prefix: 'FQT', group: 'FDY',
+    desc: 'Коммерческие предложения. Основа follow-up.',
+    statuses: ['draft', 'sent', 'negotiation', 'accepted', 'rejected', 'expired', 'archived'],
+    fields: [
+      ['rfq_id',        'ref:F_RFQ', 'Запрос'],
+      ['company_id',    'ref:Companies', 'Заказчик'],
+      ['contact_id',    'ref:Contacts',  'Кому отправлено'],
+      ['opportunity_id','ref:Opportunities', 'Сделка'],
+      ['quote_number',  'text',     'Номер КП'],
+      ['sent_at',       'datetime', 'Отправлено'],
+      ['valid_until',   'date',     'Действительно до'],
+      ['total_amount',  'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['incoterms',     'enum:INCOTERMS', 'Условия поставки'],
+      ['lead_time_days','number',   'Срок изготовления, дней'],
+      ['payment_terms', 'text',     'Условия оплаты'],
+      ['doc_id',        'ref:Documents', 'Файл КП'],
+      ['last_reply_at', 'datetime', 'Последний ответ клиента'],
+      ['followup_due_at','datetime','Когда напомнить (sent_at + N рабочих дней)'],
+      ['followup_count','number',   'Сколько раз напоминали'],
+      ['reject_reason', 'text',     'Причина отказа']
+    ]
+  },
+
+  F_Orders: {
+    prefix: 'FOR', group: 'FDY',
+    desc: 'Заказы в производстве и поставке.',
+    statuses: ['contracted', 'in_production', 'ready', 'shipped', 'delivered', 'closed', 'cancelled', 'archived'],
+    fields: [
+      ['quote_id',      'ref:F_Quotes', 'КП'],
+      ['company_id',    'ref:Companies', 'Заказчик'],
+      ['contract_doc_id','ref:Documents', 'Договор'],
+      ['order_date',    'date',     'Дата заказа'],
+      ['amount',        'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['tonnage',       'number',   'Тоннаж, т'],
+      ['prod_start',    'date',     'Начало производства'],
+      ['ship_planned',  'date',     'Отгрузка план'],
+      ['ship_actual',   'date',     'Отгрузка факт'],
+      ['delivered_at',  'date',     'Доставлено'],
+      ['carrier_company_id','ref:Companies', 'Перевозчик'],
+      ['tracking',      'text',     'Трек / номер вагона'],
+      ['paid_amount',   'money',    'Оплачено'],
+      ['payment_status','enum:PAYMENT_STATUS', 'unpaid / prepaid / partial / paid']
+    ]
+  },
+
+  F_Capacity: {
+    prefix: 'FCP', group: 'FDY',
+    desc: 'Производственные возможности по месяцам: сколько можем взять.',
+    statuses: ['plan', 'actual'],
+    fields: [
+      ['period',        'text',     'Месяц, YYYY-MM'],
+      ['line',          'text',     'Участок / печь'],
+      ['capacity_t',    'number',   'Мощность, т'],
+      ['booked_t',      'number',   'Загружено заказами, т'],
+      ['notes',         'longtext', 'Ограничения']
+    ]
+  },
+
+  /* ======================== АГРОБИЗНЕС (A_) ========================
+   * Модель намеренно минимальная: ТЗ запрещает придумывать бизнес-модель.
+   * Расширяется после получения исходных материалов.
+   */
+
+  A_Assets: {
+    prefix: 'AAS', group: 'AGR',
+    desc: 'Активы: земля, техника, хранилища, животные, прочее.',
+    statuses: ['owned', 'leased', 'planned', 'sold', 'archived'],
+    fields: [
+      ['name',          'text',     'Название'],
+      ['asset_type',    'enum:A_ASSET_TYPE', 'land / equipment / facility / livestock / other'],
+      ['location',      'text',     'Расположение'],
+      ['quantity',      'number',   'Количество / площадь'],
+      ['unit',          'text',     'Единица (га, шт, т, м²)'],
+      ['value_amount',  'money',    'Оценка стоимости'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['project_id',    'ref:Projects', 'Проект'],
+      ['notes',         'longtext', 'Заметки']
+    ]
+  },
+
+  A_Deals: {
+    prefix: 'ADL', group: 'AGR',
+    desc: 'Закупки и продажи продукции, техники, услуг.',
+    statuses: ['negotiation', 'agreed', 'in_delivery', 'done', 'cancelled', 'archived'],
+    fields: [
+      ['deal_side',     'enum:A_DEAL_SIDE', 'buy / sell'],
+      ['company_id',    'ref:Companies', 'Контрагент'],
+      ['opportunity_id','ref:Opportunities', 'Сделка'],
+      ['product',       'text',     'Продукция / товар'],
+      ['quantity',      'number',   'Количество'],
+      ['unit',          'text',     'Единица'],
+      ['price_per_unit','money',    'Цена за единицу'],
+      ['total_amount',  'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['delivery_date', 'date',     'Поставка'],
+      ['contract_doc_id','ref:Documents', 'Договор']
+    ]
+  },
+
+  A_Finance: {
+    prefix: 'AFN', group: 'AGR',
+    desc: 'Финансовые показатели по периодам.',
+    statuses: ['plan', 'actual'],
+    fields: [
+      ['period',        'text',     'YYYY-MM'],
+      ['project_id',    'ref:Projects', 'Проект'],
+      ['category',      'text',     'Статья'],
+      ['flow',          'enum:CASH_FLOW', 'income / expense'],
+      ['amount',        'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта']
+    ]
+  },
+
+  /* ======================== СКЛАДЫ И ЛОГИСТИКА (W_) ======================== */
+
+  W_Facilities: {
+    prefix: 'WFC', group: 'WHL',
+    desc: 'Складские комплексы.',
+    statuses: ['operating', 'construction', 'planned', 'for_sale', 'archived'],
+    fields: [
+      ['name',          'text',     'Название'],
+      ['region',        'text',     'Регион'],
+      ['city',          'text',     'Город'],
+      ['address',       'longtext', 'Адрес'],
+      ['lat',           'number',   'Широта'],
+      ['lng',           'number',   'Долгота'],
+      ['wh_class',      'enum:W_CLASS', 'A / B / C'],
+      ['wh_type',       'multi:W_TYPE', 'dry / cold / frozen / open / bonded'],
+      ['total_area_m2', 'number',   'Общая площадь, м²'],
+      ['usable_area_m2','number',   'Полезная площадь, м²'],
+      ['pallet_places', 'number',   'Паллетомест'],
+      ['docks',         'number',   'Доков'],
+      ['rail_access',   'bool',     'Ж/д ветка'],
+      ['owner_company_id','ref:Companies', 'Собственник'],
+      ['operator_company_id','ref:Companies', 'Оператор'],
+      ['target_rate_m2','money',    'Целевая ставка за м² в месяц'],
+      ['currency',      'enum:CURRENCY', 'Валюта']
+    ]
+  },
+
+  W_Units: {
+    prefix: 'WUN', group: 'WHL',
+    desc: 'Блоки / секции склада. Из них считается свободная и занятая площадь.',
+    statuses: ['free', 'reserved', 'occupied', 'maintenance', 'archived'],
+    fields: [
+      ['facility_id',   'ref:W_Facilities', 'Склад'],
+      ['name',          'text',     'Блок / секция'],
+      ['area_m2',       'number',   'Площадь, м²'],
+      ['pallet_places', 'number',   'Паллетомест'],
+      ['temp_mode',     'enum:W_TYPE', 'Режим'],
+      ['lease_id',      'ref:W_Leases', 'Текущий договор']
+    ]
+  },
+
+  W_Leases: {
+    prefix: 'WLS', group: 'WHL',
+    desc: 'Договоры аренды.',
+    statuses: ['draft', 'negotiation', 'signed', 'active', 'expiring', 'terminated', 'archived'],
+    fields: [
+      ['facility_id',   'ref:W_Facilities', 'Склад'],
+      ['unit_ids',      'refs:W_Units', 'Блоки'],
+      ['tenant_company_id','ref:Companies', 'Арендатор'],
+      ['area_m2',       'number',   'Площадь, м²'],
+      ['rate_m2_month', 'money',    'Ставка за м² в месяц'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['opex_included', 'bool',     'Эксплуатация включена'],
+      ['start_date',    'date',     'Начало'],
+      ['end_date',      'date',     'Окончание'],
+      ['indexation',    'text',     'Индексация'],
+      ['deposit',       'money',    'Депозит'],
+      ['contract_doc_id','ref:Documents', 'Договор']
+    ]
+  },
+
+  W_Requests: {
+    prefix: 'WRQ', group: 'WHL',
+    desc: 'Запросы потенциальных арендаторов: что ищут.',
+    statuses: ['new', 'matching', 'offered', 'viewing', 'won', 'lost', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Кто ищет'],
+      ['contact_id',    'ref:Contacts',  'Контакт'],
+      ['opportunity_id','ref:Opportunities', 'Сделка'],
+      ['area_needed_m2','number',   'Нужная площадь, м²'],
+      ['wh_type',       'multi:W_TYPE', 'Тип'],
+      ['location_pref', 'text',     'Где'],
+      ['needed_from',   'date',     'С какой даты'],
+      ['term_months',   'number',   'Срок, мес.'],
+      ['budget_rate_m2','money',    'Бюджет за м²'],
+      ['currency',      'enum:CURRENCY', 'Валюта']
+    ]
+  },
+
+  W_Opex: {
+    prefix: 'WOX', group: 'WHL',
+    desc: 'Эксплуатационные расходы по складам.',
+    statuses: ['plan', 'actual'],
+    fields: [
+      ['facility_id',   'ref:W_Facilities', 'Склад'],
+      ['period',        'text',     'YYYY-MM'],
+      ['category',      'enum:W_OPEX_CAT', 'Статья'],
+      ['amount',        'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта']
+    ]
+  },
+
+  W_Routes: {
+    prefix: 'WRT', group: 'WHL',
+    desc: 'Транспортные маршруты и ставки перевозчиков.',
+    statuses: ['active', 'quoted', 'inactive', 'archived'],
+    fields: [
+      ['origin',        'text',     'Откуда'],
+      ['destination',   'text',     'Куда'],
+      ['mode',          'enum:TRANSPORT_MODE', 'truck / rail / multimodal / air / sea'],
+      ['carrier_company_id','ref:Companies', 'Перевозчик'],
+      ['transit_days',  'number',   'Транзит, дней'],
+      ['rate',          'money',    'Ставка'],
+      ['rate_unit',     'text',     'За что (рейс, т, контейнер)'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['valid_until',   'date',     'Ставка действует до']
+    ]
+  },
+
+  /* ======================== ФЕДЕРАЦИЯ (S_) ======================== */
+
+  S_Clubs: {
+    prefix: 'SCL', group: 'WLF',
+    desc: 'Клубы, спортшколы, команды.',
+    statuses: ['active', 'inactive', 'archived'],
+    fields: [
+      ['name',          'text',     'Название'],
+      ['club_type',     'enum:S_CLUB_TYPE', 'club / school / team / center'],
+      ['region',        'text',     'Регион'],
+      ['city',          'text',     'Город'],
+      ['head_contact_id','ref:Contacts', 'Руководитель'],
+      ['company_id',    'ref:Companies', 'Юрлицо, если есть'],
+      ['athletes_count','number',   'Спортсменов (автоматически)']
+    ]
+  },
+
+  S_Coaches: {
+    prefix: 'SCH', group: 'WLF',
+    desc: 'Тренеры.',
+    statuses: ['active', 'inactive', 'archived'],
+    fields: [
+      ['contact_id',    'ref:Contacts', 'Контакт (ФИО, телефон там)'],
+      ['club_id',       'ref:S_Clubs', 'Клуб'],
+      ['region',        'text',     'Регион'],
+      ['category',      'text',     'Категория / звание'],
+      ['national_team', 'bool',     'Тренер сборной']
+    ]
+  },
+
+  S_Athletes: {
+    prefix: 'SAT', group: 'WLF',
+    desc: 'Спортсмены. Содержит персональные данные, в том числе несовершеннолетних, доступ только владельца.',
+    statuses: ['active', 'injured', 'inactive', 'retired', 'archived'],
+    fields: [
+      ['full_name',     'text',     'ФИО'],
+      ['birth_year',    'number',   'Год рождения (полная дата не нужна для работы)'],
+      ['gender',        'enum:GENDER', 'M / F'],
+      ['weight_category','enum:S_WEIGHT_CAT', 'Весовая категория'],
+      ['region',        'text',     'Регион'],
+      ['club_id',       'ref:S_Clubs', 'Клуб'],
+      ['coach_id',      'ref:S_Coaches', 'Тренер'],
+      ['sport_rank',    'enum:S_RANK', 'Разряд / звание'],
+      ['national_team', 'enum:S_SQUAD', 'none / reserve / youth / junior / main'],
+      ['best_total_kg', 'number',   'Лучшая сумма, кг (автоматически)'],
+      ['notes',         'longtext', 'Подготовка, особенности']
+    ]
+  },
+
+  S_Events: {
+    prefix: 'SEV', group: 'WLF',
+    desc: 'Календарь: турниры, чемпионаты, сборы, выезды.',
+    statuses: ['planned', 'confirmed', 'in_progress', 'done', 'cancelled', 'archived'],
+    fields: [
+      ['name',          'text',     'Название'],
+      ['event_type',    'enum:S_EVENT_TYPE', 'championship / cup / tournament / camp / trip / seminar'],
+      ['level',         'enum:S_LEVEL', 'regional / national / international'],
+      ['start_date',    'date',     'Начало'],
+      ['end_date',      'date',     'Окончание'],
+      ['city',          'text',     'Город'],
+      ['venue',         'text',     'Место'],
+      ['organizer',     'text',     'Организатор'],
+      ['is_host',       'bool',     'Федерация организует сама'],
+      ['responsible_contact_id','ref:Contacts', 'Ответственный'],
+      ['budget_planned','money',    'Бюджет план'],
+      ['budget_actual', 'money',    'Бюджет факт'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['calendar_event_id','text',  'Событие в Google Calendar'],
+      ['project_id',    'ref:Projects', 'Проект']
+    ]
+  },
+
+  S_Results: {
+    prefix: 'SRS', group: 'WLF',
+    desc: 'Результаты выступлений. Рейтинги считаются отсюда.',
+    statuses: ['official', 'unofficial', 'disqualified'],
+    fields: [
+      ['event_id',      'ref:S_Events', 'Соревнование'],
+      ['athlete_id',    'ref:S_Athletes', 'Спортсмен'],
+      ['weight_category','enum:S_WEIGHT_CAT', 'Категория'],
+      ['bodyweight_kg', 'number',   'Собственный вес'],
+      ['snatch_kg',     'number',   'Рывок'],
+      ['cj_kg',         'number',   'Толчок'],
+      ['total_kg',      'number',   'Сумма'],
+      ['place',         'number',   'Место'],
+      ['medal',         'enum:S_MEDAL', 'gold / silver / bronze / none']
+    ]
+  },
+
+  S_Sponsorships: {
+    prefix: 'SSP', group: 'WLF',
+    desc: 'Спонсорские и партнёрские соглашения. Переговоры ведутся в Opportunities.',
+    statuses: ['proposal', 'negotiation', 'signed', 'active', 'ended', 'declined', 'archived'],
+    fields: [
+      ['company_id',    'ref:Companies', 'Спонсор / партнёр'],
+      ['opportunity_id','ref:Opportunities', 'Сделка'],
+      ['package',       'text',     'Пакет'],
+      ['amount',        'money',    'Сумма'],
+      ['currency',      'enum:CURRENCY', 'Валюта'],
+      ['in_kind',       'longtext', 'Неденежный вклад'],
+      ['start_date',    'date',     'Начало'],
+      ['end_date',      'date',     'Окончание'],
+      ['obligations',   'longtext', 'Наши обязательства перед спонсором'],
+      ['contract_doc_id','ref:Documents', 'Договор']
+    ]
+  },
+
+  S_Budget: {
+    prefix: 'SBG', group: 'WLF',
+    desc: 'Бюджет федерации: план и факт по статьям и источникам.',
+    statuses: ['plan', 'approved', 'actual'],
+    fields: [
+      ['period',        'text',     'YYYY или YYYY-MM'],
+      ['item',          'text',     'Статья'],
+      ['category',      'enum:S_BUDGET_CAT', 'Категория'],
+      ['funding_source','enum:S_FUNDING', 'state / sponsor / own / grant / other'],
+      ['event_id',      'ref:S_Events', 'Мероприятие'],
+      ['planned',       'money',    'План'],
+      ['actual',        'money',    'Факт'],
+      ['currency',      'enum:CURRENCY', 'Валюта']
+    ]
+  },
+
+  S_Media: {
+    prefix: 'SMD', group: 'WLF',
+    desc: 'Медиаплан и публикации.',
+    statuses: ['idea', 'planned', 'in_production', 'published', 'cancelled', 'archived'],
+    fields: [
+      ['title',         'text',     'Тема'],
+      ['channel',       'enum:S_MEDIA_CHANNEL', 'instagram / telegram / youtube / tiktok / site / press / tv'],
+      ['format',        'enum:S_MEDIA_FORMAT', 'post / reel / video / story / article / interview / release'],
+      ['planned_at',    'datetime', 'Когда выйти'],
+      ['published_at',  'datetime', 'Вышло'],
+      ['event_id',      'ref:S_Events', 'Связанное событие'],
+      ['sponsor_company_id','ref:Companies', 'Упоминание спонсора'],
+      ['url',           'url',      'Ссылка'],
+      ['reach',         'number',   'Охват (вносится вручную)'],
+      ['responsible',   'text',     'Кто делает']
+    ]
+  }
+};
+
+/** Полный список полей таблицы с учётом общих. */
+function schemaFields_(tableName) {
+  var t = TABLES[tableName];
+  if (!t) throw new Error('Unknown table: ' + tableName);
+  if (t.system) return [['id', 'id', 'ID']].concat(t.fields);
+  // Для общих полей подставляем описание статусов конкретной таблицы
+  var common = COMMON_FIELDS.map(function (f) {
+    if (f[0] === 'status' && t.statuses) return ['status', 'text', t.statuses.join(' / ')];
+    return f;
+  });
+  return [common[0]].concat(t.fields, common.slice(1));
+}
+
+function schemaHeaders_(tableName) {
+  return schemaFields_(tableName).map(function (f) { return f[0]; });
+}
+
+
+/* ======================== Seed ======================== */
+/**
+ * BD COMMAND CENTER — Seed.gs
+ * Начальные справочники и настройки. Только структура, никаких выдуманных компаний,
+ * людей, цен или сделок.
+ */
+
+function ref_(list, rows, direction) {
+  return rows.map(function (r, i) {
+    return { list_name: list, code: r[0], label_ru: r[1], label_en: r[2] || '', direction: direction || '', sort_order: i + 1, active: true };
+  });
+}
+
+var SEED_REFERENCE = [].concat(
+  ref_('DIRECTION', [['FDY','Литейный завод','Foundry'],['AGR','Агробизнес','Agribusiness'],['WHL','Склады и логистика','Warehousing & Logistics'],['WLF','Федерация тяжёлой атлетики','Weightlifting Federation']]),
+  ref_('COUNTRY', [['KZ','Казахстан','Kazakhstan'],['UZ','Узбекистан','Uzbekistan'],['KG','Кыргызстан','Kyrgyzstan'],['TJ','Таджикистан','Tajikistan'],['TM','Туркменистан','Turkmenistan'],['RU','Россия','Russia'],['CN','Китай','China'],['AE','ОАЭ','UAE'],['MN','Монголия','Mongolia'],['AZ','Азербайджан','Azerbaijan'],['OTHER','Другая','Other']]),
+  ref_('INDUSTRY', [['mining','Горнодобывающая','Mining'],['cement','Цементная','Cement'],['metallurgy','Металлургия','Metallurgy'],['energy','Энергетика','Energy'],['oil_gas','Нефтегаз','Oil & Gas'],['railway','Железная дорога','Railway'],['construction','Строительство','Construction'],['heavy_machinery','Тяжёлое машиностроение','Heavy machinery'],['quarry','Карьеры и нерудка','Quarrying'],['agriculture','Сельское хозяйство','Agriculture'],['logistics','Логистика','Logistics'],['retail','Ритейл и дистрибуция','Retail & distribution'],['sport','Спорт','Sport'],['government','Госорганы','Government'],['finance','Финансы','Finance'],['media','Медиа','Media'],['other','Другое','Other']]),
+  ref_('COMPANY_ROLE', [['customer','Заказчик','Customer'],['supplier','Поставщик','Supplier'],['partner','Партнёр','Partner'],['sponsor','Спонсор','Sponsor'],['tenant','Арендатор','Tenant'],['logistics','Логистический оператор','Logistics operator'],['investor','Инвестор','Investor'],['government','Госорган','Government'],['media','СМИ','Media'],['competitor','Конкурент','Competitor']]),
+  ref_('COMPANY_SIZE', [['micro','Микро','Micro'],['small','Малая','Small'],['medium','Средняя','Medium'],['large','Крупная','Large'],['holding','Холдинг','Holding']]),
+  ref_('VERIFICATION', [['verified','Проверено','Verified'],['unverified','Не проверено','Unverified'],['unknown','Нет данных','Unknown']]),
+  ref_('PRIORITY', [['P1','Высокий','High'],['P2','Средний','Medium'],['P3','Низкий','Low']]),
+  ref_('CURRENCY', [['KZT','Тенге','KZT'],['USD','Доллар США','USD'],['EUR','Евро','EUR'],['RUB','Рубль','RUB'],['UZS','Сум','UZS'],['KGS','Сом','KGS'],['CNY','Юань','CNY'],['AED','Дирхам','AED']]),
+  ref_('DECISION_ROLE', [['decision_maker','Принимает решение','Decision maker'],['influencer','Влияет','Influencer'],['procurement','Закупки','Procurement'],['technical','Технический специалист','Technical'],['user','Пользователь продукции','User'],['other','Другое','Other']]),
+  ref_('LANGUAGE', [['ru','Русский','Russian'],['kk','Казахский','Kazakh'],['uz','Узбекский','Uzbek'],['ky','Кыргызский','Kyrgyz'],['en','Английский','English'],['zh','Китайский','Chinese']]),
+  ref_('HEALTH', [['green','В норме','On track'],['yellow','Есть риски','At risk'],['red','Проблема','Off track']]),
+  ref_('TASK_TYPE', [['task','Задача','Task'],['call','Звонок','Call'],['email','Письмо','Email'],['visit','Визит','Visit'],['document','Документ','Document'],['followup','Follow-up','Follow-up']]),
+  ref_('MEETING_TYPE', [['meeting','Встреча','Meeting'],['call','Звонок','Call'],['video','Видеозвонок','Video call'],['site_visit','Выезд на объект','Site visit'],['event','Мероприятие','Event']]),
+  ref_('AGREEMENT_SIDE', [['me','Я должен','I owe'],['them','Они должны','They owe'],['both','Обе стороны','Both']]),
+  ref_('RATING', [['1','1','1'],['2','2','2'],['3','3','3'],['4','4','4'],['5','5','5']]),
+  ref_('DOC_TYPE', [['rfq','Запрос (RFQ)','RFQ'],['quote','Коммерческое предложение','Quote'],['contract','Договор','Contract'],['protocol','Протокол','Minutes'],['drawing','Чертёж','Drawing'],['spec','Техническая спецификация','Specification'],['invoice','Счёт','Invoice'],['presentation','Презентация','Presentation'],['report','Отчёт','Report'],['other','Другое','Other']]),
+  ref_('PAYMENT_STATUS', [['unpaid','Не оплачено','Unpaid'],['prepaid','Предоплата','Prepaid'],['partial','Частично','Partial'],['paid','Оплачено','Paid']]),
+  ref_('CASH_FLOW', [['income','Доход','Income'],['expense','Расход','Expense']]),
+  ref_('TRANSPORT_MODE', [['truck','Авто','Truck'],['rail','Ж/д','Rail'],['multimodal','Мультимодально','Multimodal'],['air','Авиа','Air'],['sea','Море','Sea']]),
+  ref_('GENDER', [['M','Мужской','Male'],['F','Женский','Female']]),
+
+  // Этапы сделок — свои для каждого направления
+  ref_('OPP_STAGE', [['lead','Лид','Lead'],['contact','Первый контакт','Contacted'],['rfq','Получен запрос','RFQ received'],['quoted','КП отправлено','Quoted'],['negotiation','Переговоры','Negotiation'],['contract','Договор','Contract'],['won','Выиграно','Won'],['lost','Проиграно','Lost']], 'FDY'),
+  ref_('OPP_STAGE', [['lead','Лид','Lead'],['discussion','Обсуждение','Discussion'],['offer','Предложение','Offer'],['negotiation','Переговоры','Negotiation'],['won','Выиграно','Won'],['lost','Проиграно','Lost']], 'AGR'),
+  ref_('OPP_STAGE', [['request','Запрос площади','Space request'],['matching','Подбор','Matching'],['offer','Предложение','Offer'],['viewing','Просмотр','Viewing'],['loi','Протокол намерений','LOI'],['lease','Договор аренды','Lease'],['won','Заселён','Moved in'],['lost','Проиграно','Lost']], 'WHL'),
+  ref_('OPP_STAGE', [['prospect','Потенциальный спонсор','Prospect'],['contact','Контакт','Contacted'],['proposal','Предложение отправлено','Proposal sent'],['negotiation','Переговоры','Negotiation'],['signed','Подписано','Signed'],['declined','Отказ','Declined']], 'WLF'),
+
+  // Литейка
+  ref_('F_PRODUCT_CATEGORY', [['casting','Промышленные отливки','Industrial castings'],['wear_parts','Износостойкие детали','Wear parts'],['crusher_hammer','Молотки дробилок','Crusher hammers'],['blow_bar','Билы','Blow bars'],['liner','Футеровки','Liners'],['jaw_plate','Щёки и бронеплиты','Jaw & armour plates'],['mill_parts','Комплектующие мельниц','Mill parts'],['spare_parts','Запчасти','Spare parts'],['custom','По чертежу заказчика','Custom to drawing']], 'FDY'),
+  ref_('INCOTERMS', [['EXW','EXW','EXW'],['FCA','FCA','FCA'],['CPT','CPT','CPT'],['CIP','CIP','CIP'],['DAP','DAP','DAP'],['DDP','DDP','DDP'],['FOB','FOB','FOB'],['CFR','CFR','CFR'],['CIF','CIF','CIF']], 'FDY'),
+
+  // Агро
+  ref_('A_ASSET_TYPE', [['land','Земля','Land'],['equipment','Техника','Equipment'],['facility','Объект / хранилище','Facility'],['livestock','Поголовье','Livestock'],['other','Другое','Other']], 'AGR'),
+  ref_('A_DEAL_SIDE', [['buy','Покупка','Buy'],['sell','Продажа','Sell']], 'AGR'),
+
+  // Склады
+  ref_('W_CLASS', [['A','Класс A','Class A'],['B','Класс B','Class B'],['C','Класс C','Class C']], 'WHL'),
+  ref_('W_TYPE', [['dry','Сухой','Dry'],['cold','Холодильный','Cold'],['frozen','Морозильный','Frozen'],['open','Открытая площадка','Open yard'],['bonded','СВХ / таможенный','Bonded']], 'WHL'),
+  ref_('W_OPEX_CAT', [['utilities','Коммунальные','Utilities'],['security','Охрана','Security'],['maintenance','Ремонт и обслуживание','Maintenance'],['staff','Персонал','Staff'],['tax','Налоги на имущество и землю','Property tax'],['insurance','Страхование','Insurance'],['other','Прочее','Other']], 'WHL'),
+
+  // Федерация
+  ref_('S_CLUB_TYPE', [['club','Клуб','Club'],['school','Спортшкола','Sports school'],['team','Команда','Team'],['center','Центр подготовки','Training center']], 'WLF'),
+  // [Проверить] Весовые категории IWF, действующие с 2025 г.
+  ref_('S_WEIGHT_CAT', [['M60','М 60','M 60'],['M65','М 65','M 65'],['M71','М 71','M 71'],['M79','М 79','M 79'],['M88','М 88','M 88'],['M94','М 94','M 94'],['M110','М 110','M 110'],['M110+','М +110','M +110'],['W48','Ж 48','W 48'],['W53','Ж 53','W 53'],['W58','Ж 58','W 58'],['W63','Ж 63','W 63'],['W69','Ж 69','W 69'],['W77','Ж 77','W 77'],['W86','Ж 86','W 86'],['W86+','Ж +86','W +86']], 'WLF'),
+  ref_('S_RANK', [['r3','3 разряд',''],['r2','2 разряд',''],['r1','1 разряд',''],['kms','КМС','CMS'],['ms','МС','MS'],['msmk','МСМК','MSIC'],['zms','ЗМС','HMS']], 'WLF'),
+  ref_('S_SQUAD', [['none','Не в сборной','None'],['reserve','Резерв','Reserve'],['youth','Юношеская','Youth'],['junior','Юниорская','Junior'],['main','Основной состав','Senior']], 'WLF'),
+  ref_('S_EVENT_TYPE', [['championship','Чемпионат','Championship'],['cup','Кубок','Cup'],['tournament','Турнир','Tournament'],['camp','УТС / сборы','Training camp'],['trip','Выезд','Trip'],['seminar','Семинар','Seminar']], 'WLF'),
+  ref_('S_LEVEL', [['regional','Региональный','Regional'],['national','Национальный','National'],['international','Международный','International']], 'WLF'),
+  ref_('S_MEDAL', [['gold','Золото','Gold'],['silver','Серебро','Silver'],['bronze','Бронза','Bronze'],['none','Без медали','None']], 'WLF'),
+  ref_('S_BUDGET_CAT', [['events','Соревнования','Events'],['camps','Сборы','Camps'],['equipment','Инвентарь','Equipment'],['salaries','Оплата труда','Salaries'],['travel','Командировки','Travel'],['media','Медиа и PR','Media & PR'],['admin','Административные','Admin'],['other','Прочее','Other']], 'WLF'),
+  ref_('S_FUNDING', [['state','Бюджет / гос.','State'],['sponsor','Спонсоры','Sponsors'],['own','Собственные','Own'],['grant','Гранты','Grants'],['other','Другое','Other']], 'WLF'),
+  ref_('S_MEDIA_CHANNEL', [['instagram','Instagram','Instagram'],['telegram','Telegram','Telegram'],['youtube','YouTube','YouTube'],['tiktok','TikTok','TikTok'],['site','Сайт','Website'],['press','Пресса','Press'],['tv','ТВ','TV']], 'WLF'),
+  ref_('S_MEDIA_FORMAT', [['post','Пост','Post'],['reel','Reels / шортс','Reel'],['video','Видео','Video'],['story','Сторис','Story'],['article','Статья','Article'],['interview','Интервью','Interview'],['release','Пресс-релиз','Press release']], 'WLF')
+);
+
+var SEED_SETTINGS = [
+  ['timezone',               'Asia/Almaty', 'string', 'Часовой пояс'],
+  ['notify.enabled',         'true',  'bool',   'Уведомления включены'],
+  ['notify.morning_time',    '08:00', 'time',   'Утренний отчёт'],
+  ['notify.evening_time',    '18:00', 'time',   'Вечерний отчёт'],
+  ['notify.premeeting_min',  '30',    'number', 'За сколько минут напоминать о встрече'],
+  ['notify.quiet_from',      '22:00', 'time',   'Тихие часы: начало'],
+  ['notify.quiet_to',        '07:30', 'time',   'Тихие часы: конец'],
+  ['notify.types',           'morning,evening,pre_meeting,followup,overdue,error', 'string', 'Какие типы уведомлений отправлять'],
+  ['followup.quote_days',    '5',     'number', 'Через сколько рабочих дней без ответа на КП предлагать follow-up'],
+  ['followup.workdays',      '1,2,3,4,5', 'string', 'Рабочие дни (1 = понедельник)'],
+  ['telegram.poll_minutes',  '2',     'number', 'Как часто бот проверяет новые сообщения'],
+  ['ai.model',               'claude-sonnet-5-5', 'string', 'Модель Claude API'],
+  ['ai.max_tokens',          '2000',  'number', 'Максимальная длина ответа AI'],
+  ['ai.monthly_budget_usd',  '30',    'number', 'Лимит расходов на AI в месяц; при превышении AI отключается до конца месяца'],
+  ['backup.keep_days',       '30',    'number', 'Сколько ежедневных бэкапов хранить'],
+  ['ui.theme',               'auto',  'string', 'light / dark / auto'],
+  ['ui.default_currency',    'KZT',   'string', 'Валюта по умолчанию']
+];
+
+
+/* ======================== Setup ======================== */
+/**
+ * BD COMMAND CENTER — Setup.gs
+ * Разворачивает инфраструктуру в Google-аккаунте владельца.
+ * Запуск: выбрать функцию setup в редакторе Apps Script и нажать «Выполнить».
+ * Повторный запуск безопасен: существующее не пересоздаётся, недостающее досоздаётся,
+ * новые колонки из Schema.gs добавляются в конец листа.
+ */
+
+var ROOT_FOLDER_NAME = 'BD COMMAND CENTER';
+var DB_FILE_NAME = 'BD COMMAND CENTER — DB';
+
+var DRIVE_TREE = {
+  '00_SYSTEM': [],
+  '01_FOUNDRY': ['Companies', 'RFQ', 'Quotes', 'Drawings'],
+  '02_AGRIBUSINESS': ['Companies', 'Contracts'],
+  '03_WAREHOUSING_LOGISTICS': ['Companies', 'Facilities', 'Leases'],
+  '04_WEIGHTLIFTING_FEDERATION': ['Companies', 'Events', 'Sponsors', 'Media'],
+  '05_SHARED_DOCUMENTS': [],
+  '06_REPORTS': [],
+  '07_BACKUPS': [],
+  '08_ARCHIVE': []
+};
+
+function setup() {
+  var props = PropertiesService.getScriptProperties();
+  var report = [];
+
+  // 1. Владелец
+  var me = Session.getEffectiveUser().getEmail();
+  if (!props.getProperty('OWNER_EMAIL')) {
+    props.setProperty('OWNER_EMAIL', me);
+    report.push('OWNER_EMAIL = ' + me);
+  }
+
+  // 2. Папки Drive
+  var root = getOrCreateRootFolder_(props, report);
+  var folderIds = {};
+  Object.keys(DRIVE_TREE).forEach(function (name) {
+    var f = getOrCreateChild_(root, name, report);
+    folderIds[name] = f.getId();
+    DRIVE_TREE[name].forEach(function (sub) { getOrCreateChild_(f, sub, report); });
+  });
+  props.setProperty('FOLDER_IDS', JSON.stringify(folderIds));
+
+  // 3. Мастер-таблица
+  var ss = getOrCreateDb_(props, DriveApp.getFolderById(folderIds['00_SYSTEM']), report);
+  ss.setSpreadsheetTimeZone('Asia/Almaty');
+
+  // 4. Листы и заголовки
+  Object.keys(TABLES).forEach(function (name) {
+    ensureSheet_(ss, name, report);
+  });
+  removeDefaultSheet_(ss);
+
+  // 5. Справочники и настройки (только если пусто)
+  seedDirections_(ss, folderIds, report);
+  seedIfEmpty_(ss, 'Settings', SEED_SETTINGS.map(function (s) {
+    return { id: newId_('SET'), key: s[0], value: s[1], value_type: s[2], description: s[3] };
+  }), report);
+  seedIfEmpty_(ss, 'ReferenceData', SEED_REFERENCE.map(function (r) {
+    var o = JSON.parse(JSON.stringify(r)); o.id = newId_('REF'); return o;
+  }), report);
+
+  // 6. Журнал
+  appendRow_(ss, 'ActivityLog', {
+    id: newId_('ACT'), created_at: new Date(), updated_at: new Date(), status: 'ok',
+    owner: me, source: 'system', rev: 1, actor: 'system', action: 'setup',
+    entity_type: 'System', note: report.length ? report.join('\n').slice(0, 45000) : 'Без изменений'
+  });
+
+  var msg = 'Готово.\nТаблица: ' + ss.getUrl() + '\nПапка: ' + root.getUrl() +
+            '\n\nИзменения:\n' + (report.length ? report.join('\n') : 'ничего, всё уже было на месте');
+  Logger.log(msg);
+  return msg;
+}
+
+/* ---------- Drive ---------- */
+
+function getOrCreateRootFolder_(props, report) {
+  var id = props.getProperty('ROOT_FOLDER_ID');
+  if (id) {
+    try { var f = DriveApp.getFolderById(id); if (!f.isTrashed()) return f; } catch (e) { /* пересоздадим */ }
+  }
+  var it = DriveApp.getRootFolder().getFoldersByName(ROOT_FOLDER_NAME);
+  var folder;
+  if (it.hasNext()) {
+    folder = it.next();
+  } else {
+    folder = DriveApp.getRootFolder().createFolder(ROOT_FOLDER_NAME);
+    report.push('Папка: ' + ROOT_FOLDER_NAME);
+  }
+  props.setProperty('ROOT_FOLDER_ID', folder.getId());
+  return folder;
+}
+
+function getOrCreateChild_(parent, name, report) {
+  var it = parent.getFoldersByName(name);
+  if (it.hasNext()) return it.next();
+  report.push('Папка: ' + parent.getName() + '/' + name);
+  return parent.createFolder(name);
+}
+
+/* ---------- Spreadsheet ---------- */
+
+function getOrCreateDb_(props, systemFolder, report) {
+  var id = props.getProperty('SPREADSHEET_ID');
+  if (id) {
+    try { return SpreadsheetApp.openById(id); } catch (e) { /* пересоздадим */ }
+  }
+  var it = systemFolder.getFilesByName(DB_FILE_NAME);
+  var ss;
+  if (it.hasNext()) {
+    ss = SpreadsheetApp.open(it.next());
+  } else {
+    ss = SpreadsheetApp.create(DB_FILE_NAME);
+    DriveApp.getFileById(ss.getId()).moveTo(systemFolder);
+    report.push('Таблица: ' + DB_FILE_NAME);
+  }
+  props.setProperty('SPREADSHEET_ID', ss.getId());
+  return ss;
+}
+
+function ensureSheet_(ss, name, report) {
+  var fields = schemaFields_(name);
+  var headers = fields.map(function (f) { return f[0]; });
+  var sh = ss.getSheetByName(name);
+
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sh.getRange(1, 1, 1, headers.length).setNotes([fields.map(function (f) { return f[2] + '\nТип: ' + f[1]; })]);
+    styleSheet_(sh, fields, TABLES[name].group);
+    report.push('Лист: ' + name + ' (' + headers.length + ' колонок)');
+    return sh;
+  }
+
+  // Лист есть: добавляем недостающие колонки в конец, ничего не удаляем
+  var lastCol = Math.max(sh.getLastColumn(), 1);
+  var existing = sh.getRange(1, 1, 1, lastCol).getValues()[0].map(String);
+  var missing = fields.filter(function (f) { return existing.indexOf(f[0]) === -1; });
+  if (missing.length) {
+    var start = existing.filter(String).length + 1;
+    sh.getRange(1, start, 1, missing.length).setValues([missing.map(function (f) { return f[0]; })]);
+    sh.getRange(1, start, 1, missing.length).setNotes([missing.map(function (f) { return f[2] + '\nТип: ' + f[1]; })]);
+    report.push('Лист ' + name + ': добавлены колонки ' + missing.map(function (f) { return f[0]; }).join(', '));
+  }
+  return sh;
+}
+
+var GROUP_COLORS = { common: '#2B2F36', system: '#5A5F66', FDY: '#3A3F47', AGR: '#4B6B3C', WHL: '#4A5A78', WLF: '#7A4B3A' };
+
+function styleSheet_(sh, fields, group) {
+  var n = fields.length;
+  sh.setFrozenRows(1);
+  sh.setFrozenColumns(1);
+  sh.getRange(1, 1, 1, n)
+    .setFontWeight('bold').setFontColor('#FFFFFF')
+    .setBackground(GROUP_COLORS[group] || '#2B2F36')
+    .setWrap(false);
+  sh.setTabColor(GROUP_COLORS[group] || '#2B2F36');
+
+  var maxRows = sh.getMaxRows();
+  fields.forEach(function (f, i) {
+    var col = i + 1, type = f[1];
+    var rng = sh.getRange(2, col, Math.max(maxRows - 1, 1), 1);
+    if (type === 'datetime') rng.setNumberFormat('yyyy-mm-dd hh:mm');
+    else if (type === 'date') rng.setNumberFormat('yyyy-mm-dd');
+    else if (type === 'money') rng.setNumberFormat('#,##0.00');
+    else if (type === 'percent') rng.setNumberFormat('0"%"');
+    else if (type === 'id' || type === 'text' || type.indexOf('ref') === 0 || type.indexOf('enum') === 0 || type.indexOf('multi') === 0 || type === 'phone') rng.setNumberFormat('@');
+  });
+
+  // Предупреждение при ручной правке заголовков
+  var p = sh.getRange(1, 1, 1, n).protect().setDescription('Заголовки схемы. Переименование сломает систему.');
+  p.setWarningOnly(true);
+}
+
+function removeDefaultSheet_(ss) {
+  ['Sheet1', 'Лист1', 'Лист 1'].forEach(function (nm) {
+    var sh = ss.getSheetByName(nm);
+    if (sh && ss.getSheets().length > 1 && sh.getLastRow() === 0) ss.deleteSheet(sh);
+  });
+}
+
+/* ---------- Seed ---------- */
+
+function seedDirections_(ss, folderIds, report) {
+  var sh = ss.getSheetByName('BusinessDirections');
+  if (sh.getLastRow() > 1) return;
+  var rows = DIRECTIONS.map(function (d) {
+    return { id: 'DIR-' + d.code, code: d.code, name: d.name, name_en: d.name_en, table_prefix: d.prefix,
+             color: d.color, sort_order: d.order, drive_folder_id: folderIds[d.folder] || '', active: true };
+  });
+  writeObjects_(sh, rows);
+  report.push('Направления: 4');
+}
+
+function seedIfEmpty_(ss, sheetName, objects, report) {
+  var sh = ss.getSheetByName(sheetName);
+  if (sh.getLastRow() > 1) return;
+  writeObjects_(sh, objects);
+  report.push(sheetName + ': ' + objects.length + ' строк');
+}
+
+function writeObjects_(sh, objects) {
+  if (!objects.length) return;
+  var headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  var values = objects.map(function (o) {
+    return headers.map(function (h) { return o[h] === undefined ? '' : o[h]; });
+  });
+  sh.getRange(sh.getLastRow() + 1, 1, values.length, headers.length).setValues(values);
+}
+
+function appendRow_(ss, sheetName, obj) {
+  writeObjects_(ss.getSheetByName(sheetName), [obj]);
+}
+
+/* ---------- ID ---------- */
+
+function newId_(prefix) {
+  var d = Utilities.formatDate(new Date(), 'Asia/Almaty', 'yyMMdd');
+  var rnd = Utilities.getUuid().replace(/-/g, '').toUpperCase().slice(0, 6);
+  return prefix + '-' + d + '-' + rnd;
+}
+
+/* ======================== Config ======================== */
+/**
+ * BD COMMAND CENTER — Config.gs
+ * Доступ к Script Properties, мастер-таблице и листу Settings.
+ */
+
+var API_VERSION = '0.3.0';
+var __ss = null;
+var __settings = null;
+
+function prop_(key) {
+  return PropertiesService.getScriptProperties().getProperty(key);
+}
+
+function ss_() {
+  if (!__ss) {
+    var id = prop_('SPREADSHEET_ID');
+    if (!id) throw apiError_('NOT_SET_UP', 'База не развёрнута. Запустите setup() в редакторе Apps Script.');
+    __ss = SpreadsheetApp.openById(id);
+  }
+  return __ss;
+}
+
+/** Настройки из листа Settings с приведением типов. */
+function settings_() {
+  if (__settings) return __settings;
+  var sh = ss_().getSheetByName('Settings');
+  var values = sh.getDataRange().getValues();
+  var h = values[0];
+  var iKey = h.indexOf('key'), iVal = h.indexOf('value'), iType = h.indexOf('value_type');
+  var out = {};
+  for (var r = 1; r < values.length; r++) {
+    var k = String(values[r][iKey] || '').trim();
+    if (!k) continue;
+    var v = values[r][iVal], t = values[r][iType];
+    if (t === 'number') v = Number(v);
+    else if (t === 'bool') v = (v === true || String(v).toLowerCase() === 'true');
+    else if (t === 'json') { try { v = JSON.parse(v); } catch (e) { /* оставляем строкой */ } }
+    else if (v instanceof Date) v = Utilities.formatDate(v, 'Asia/Almaty', 'HH:mm');
+    else v = String(v);
+    out[k] = v;
+  }
+  __settings = out;
+  return out;
+}
+
+function setting_(key, fallback) {
+  var s = settings_();
+  return s.hasOwnProperty(key) ? s[key] : fallback;
+}
+
+function ownerEmail_() {
+  var e = prop_('OWNER_EMAIL');
+  if (!e) throw apiError_('NOT_SET_UP', 'Не задан OWNER_EMAIL. Запустите setup().');
+  return e;
+}
+
+/* ---------- Ошибки API ---------- */
+
+function apiError_(code, message, details) {
+  var e = new Error(message || code);
+  e.isApiError = true;
+  e.code = code;
+  e.details = details || null;
+  return e;
+}
+
+/* ---------- Хеш ---------- */
+
+function sha256Hex_(text) {
+  var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(text), Utilities.Charset.UTF_8);
+  return bytes.map(function (b) { var v = (b < 0 ? b + 256 : b).toString(16); return v.length === 1 ? '0' + v : v; }).join('');
+}
+
+/* ======================== Db ======================== */
+/**
+ * BD COMMAND CENTER — Db.gs
+ * Слой данных поверх Google Sheets: пакетное чтение, индекс по ID, блокировки,
+ * защита от перезаписи (rev), проверка дублей и ссылок, журнал изменений.
+ */
+
+var __tables = {};       // кэш таблиц на время одного запроса
+var __refCodes = null;   // справочники: list_name -> {code: true}
+
+var SYSTEM_FIELDS = ['id', 'created_at', 'updated_at', 'rev', 'deleted_at', 'source', 'name_norm'];
+
+var REQUIRED_FIELDS = {
+  Companies: ['name'], Contacts: ['full_name'], Projects: ['name'], Tasks: ['title'],
+  Meetings: ['title', 'start_at'], Agreements: ['description'], Opportunities: ['title'],
+  Documents: ['title'], Notes: ['body'], Suppliers: ['company_id'], Customers: ['company_id'],
+  F_Products: ['name'], F_RFQ: ['company_id'], F_Costing: ['item_name'], F_Quotes: ['company_id'],
+  F_Orders: ['company_id'], F_Capacity: ['period'],
+  A_Assets: ['name'], A_Deals: ['deal_side'], A_Finance: ['period', 'amount'],
+  W_Facilities: ['name'], W_Units: ['facility_id', 'name'], W_Leases: ['facility_id', 'tenant_company_id'],
+  W_Requests: ['company_id'], W_Opex: ['facility_id', 'period', 'amount'], W_Routes: ['origin', 'destination'],
+  S_Clubs: ['name'], S_Coaches: ['contact_id'], S_Athletes: ['full_name'], S_Events: ['name', 'start_date'],
+  S_Results: ['event_id', 'athlete_id'], S_Sponsorships: ['company_id'], S_Budget: ['period', 'item'],
+  S_Media: ['title']
+};
+
+var LABEL_FIELDS = ['name', 'title', 'full_name', 'quote_number', 'item_name', 'description', 'body', 'period'];
+
+/* ======================= Чтение ======================= */
+
+function isWorkTable_(name) {
+  return !!TABLES[name] && TABLES[name].group !== 'system';
+}
+
+function assertWorkTable_(name) {
+  if (!isWorkTable_(name)) throw apiError_('BAD_TABLE', 'Таблица недоступна: ' + name);
+}
+
+function loadTable_(name, fresh) {
+  if (!fresh && __tables[name]) return __tables[name];
+  var sh = ss_().getSheetByName(name);
+  if (!sh) throw apiError_('NOT_SET_UP', 'Нет листа ' + name + '. Запустите setup().');
+  var values = sh.getDataRange().getValues();
+  var headers = values[0].map(String);
+  var rows = [], index = {};
+  var iId = headers.indexOf('id');
+  for (var r = 1; r < values.length; r++) {
+    var id = String(values[r][iId] || '');
+    if (!id) continue;
+    var obj = {};
+    for (var c = 0; c < headers.length; c++) if (headers[c]) obj[headers[c]] = values[r][c];
+    obj._row = r + 1;
+    index[id] = rows.length;
+    rows.push(obj);
+  }
+  __tables[name] = { name: name, sheet: sh, headers: headers, rows: rows, index: index };
+  return __tables[name];
+}
+
+function invalidate_(name) { delete __tables[name]; }
+
+function findById_(name, id) {
+  var t = loadTable_(name);
+  var i = t.index[String(id)];
+  return i === undefined ? null : t.rows[i];
+}
+
+/** Объект для отдачи в API: даты в ISO, служебные поля убраны. */
+function serialize_(obj) {
+  var out = {};
+  Object.keys(obj).forEach(function (k) {
+    if (k.charAt(0) === '_') return;
+    var v = obj[k];
+    out[k] = (v instanceof Date) ? (isNaN(v.getTime()) ? '' : v.toISOString()) : v;
+  });
+  return out;
+}
+
+function labelOf_(obj) {
+  if (!obj) return '';
+  for (var i = 0; i < LABEL_FIELDS.length; i++) {
+    var v = obj[LABEL_FIELDS[i]];
+    if (v !== '' && v !== null && v !== undefined) return String(v).slice(0, 80);
+  }
+  return String(obj.id);
+}
+
+/** Подписи для ссылочных полей: {field: {id: label}} */
+function refLabels_(name, items) {
+  var out = {};
+  schemaFields_(name).forEach(function (f) {
+    var m = String(f[1]).match(/^refs?:(.+)$/);
+    if (!m || !TABLES[m[1]]) return;
+    var ids = {};
+    items.forEach(function (it) {
+      String(it[f[0]] || '').split(',').forEach(function (x) { x = x.trim(); if (x) ids[x] = true; });
+    });
+    var keys = Object.keys(ids);
+    if (!keys.length) return;
+    var map = {};
+    keys.forEach(function (id) { var o = findById_(m[1], id); map[id] = o ? labelOf_(o) : '(не найдено)'; });
+    out[f[0]] = map;
+  });
+  return out;
+}
+
+/* ======================= Список и поиск ======================= */
+
+function dbList_(name, opts) {
+  assertWorkTable_(name);
+  opts = opts || {};
+  var t = loadTable_(name);
+  var q = String(opts.q || '').toLowerCase().trim();
+  var filters = opts.filters || {};
+  var items = t.rows.filter(function (r) {
+    if (!opts.includeArchived && (r.status === 'archived' || r.deleted_at)) return false;
+    if (opts.direction && String(r.direction || '').split(',').map(function (s) { return s.trim(); }).indexOf(opts.direction) === -1) return false;
+    if (opts.status && r.status !== opts.status) return false;
+    for (var k in filters) {
+      if (!filters.hasOwnProperty(k) || filters[k] === '' || filters[k] === null) continue;
+      if (String(r[k]).split(',').map(function (s) { return s.trim(); }).indexOf(String(filters[k])) === -1) return false;
+    }
+    if (q) return rowText_(r).indexOf(q) !== -1;
+    return true;
+  });
+
+  var sort = opts.sort || '-updated_at';
+  var desc = sort.charAt(0) === '-', key = desc ? sort.slice(1) : sort;
+  items.sort(function (a, b) {
+    var x = a[key], y = b[key];
+    if (x instanceof Date) x = x.getTime();
+    if (y instanceof Date) y = y.getTime();
+    if (x === '' || x === undefined) return 1;
+    if (y === '' || y === undefined) return -1;
+    return (x < y ? -1 : x > y ? 1 : 0) * (desc ? -1 : 1);
+  });
+
+  var total = items.length;
+  var offset = Math.max(0, Number(opts.offset) || 0);
+  var limit = Math.min(500, Math.max(1, Number(opts.limit) || 200));
+  var page = items.slice(offset, offset + limit).map(serialize_);
+  return { items: page, total: total, labels: refLabels_(name, page) };
+}
+
+function rowText_(r) {
+  var s = [];
+  for (var k in r) if (r.hasOwnProperty(k) && k.charAt(0) !== '_' && typeof r[k] === 'string') s.push(r[k]);
+  return s.join(' \u0001 ').toLowerCase();
+}
+
+var SEARCH_TABLES = ['Companies', 'Contacts', 'Projects', 'Opportunities', 'Tasks', 'Meetings', 'Agreements', 'Documents', 'Notes'];
+
+function dbSearch_(q) {
+  q = String(q || '').trim();
+  if (q.length < 2) return { results: [] };
+  var results = [];
+  SEARCH_TABLES.forEach(function (name) {
+    var res = dbList_(name, { q: q, limit: 8 });
+    res.items.forEach(function (it) { results.push({ table: name, id: it.id, label: labelOf_(it), status: it.status, direction: it.direction }); });
+  });
+  return { results: results };
+}
+
+/* ======================= Карточка ======================= */
+
+function dbGet_(name, id) {
+  assertWorkTable_(name);
+  var rec = findById_(name, id);
+  if (!rec) throw apiError_('NOT_FOUND', 'Запись не найдена: ' + id);
+  var out = { record: serialize_(rec), labels: refLabels_(name, [rec]), related: [], activity: [] };
+
+  // Все таблицы, у которых есть ссылка на эту
+  Object.keys(TABLES).forEach(function (other) {
+    if (!isWorkTable_(other)) return;
+    var refFields = schemaFields_(other).filter(function (f) {
+      var m = String(f[1]).match(/^refs?:(.+)$/);
+      return m && m[1] === name;
+    }).map(function (f) { return f[0]; });
+    var hasGeneric = schemaHeaders_(other).indexOf('related_id') !== -1;
+    if (!refFields.length && !hasGeneric) return;
+
+    var t = loadTable_(other);
+    var hits = t.rows.filter(function (r) {
+      if (r.status === 'archived' || r.deleted_at) return false;
+      if (hasGeneric && String(r.related_id) === String(id)) return true;
+      return refFields.some(function (f) {
+        return String(r[f] || '').split(',').map(function (s) { return s.trim(); }).indexOf(String(id)) !== -1;
+      });
+    });
+    if (!hits.length) return;
+    hits.sort(function (a, b) { return (b.updated_at || 0) - (a.updated_at || 0); });
+    out.related.push({
+      table: other, total: hits.length,
+      items: hits.slice(0, 25).map(function (r) { return { id: r.id, label: labelOf_(r), status: r.status, updated_at: serialize_(r).updated_at }; })
+    });
+  });
+
+  var log = loadTable_('ActivityLog').rows.filter(function (r) { return String(r.entity_id) === String(id); });
+  out.activity = log.slice(-30).reverse().map(function (r) {
+    return { at: serialize_(r).created_at, actor: r.actor, action: r.action, diff: r.diff_json, note: r.note };
+  });
+  return out;
+}
+
+/* ======================= Запись ======================= */
+
+function withLock_(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw apiError_('BUSY', 'База занята другим запросом, повторите через пару секунд.');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function dbCreate_(name, input, opts) {
+  assertWorkTable_(name);
+  opts = opts || {};
+  var def = TABLES[name];
+  var rec = sanitize_(name, input || {}, false);
+  var now = new Date();
+
+  rec.id = newId_(def.prefix);
+  rec.created_at = now;
+  rec.updated_at = now;
+  rec.rev = 1;
+  rec.status = rec.status || def.statuses[0];
+  rec.owner = rec.owner || ownerEmail_();
+  rec.source = opts.source || 'manual';
+  if (name === 'Companies') rec.name_norm = normName_(rec.name);
+
+  (REQUIRED_FIELDS[name] || []).forEach(function (f) {
+    if (rec[f] === '' || rec[f] === undefined || rec[f] === null) {
+      throw apiError_('VALIDATION', 'Не заполнено обязательное поле', { field: f });
+    }
+  });
+
+  return withLock_(function () {
+    invalidate_(name);
+    var t = loadTable_(name, true);
+    if (!opts.force) {
+      var dup = findDuplicate_(name, rec, t);
+      if (dup) throw apiError_('DUPLICATE', 'Похоже, такая запись уже есть', { existing: serialize_(dup), label: labelOf_(dup) });
+    }
+    appendObjects_(t, [rec]);
+    invalidate_(name);
+    logActivity_(opts.actor || 'owner', 'create', name, rec.id, null, opts.note || '');
+    return { record: serialize_(rec) };
+  });
+}
+
+function dbUpdate_(name, id, rev, patch, opts) {
+  assertWorkTable_(name);
+  opts = opts || {};
+  var clean = sanitize_(name, patch || {}, true);
+  if (!Object.keys(clean).length) throw apiError_('VALIDATION', 'Нет изменений');
+
+  return withLock_(function () {
+    invalidate_(name);
+    var t = loadTable_(name, true);
+    var cur = findById_(name, id);
+    if (!cur) throw apiError_('NOT_FOUND', 'Запись не найдена: ' + id);
+    if (rev !== undefined && rev !== null && Number(cur.rev) !== Number(rev)) {
+      throw apiError_('CONFLICT', 'Запись изменилась с момента открытия. Обновите карточку.', { current: serialize_(cur) });
+    }
+    var diff = {};
+    Object.keys(clean).forEach(function (k) {
+      var before = cur[k], after = clean[k];
+      var b = before instanceof Date ? before.getTime() : before;
+      var a = after instanceof Date ? after.getTime() : after;
+      if (String(b) !== String(a)) {
+        diff[k] = [serialize_({ v: before }).v, serialize_({ v: after }).v];
+        cur[k] = after;
+      }
+    });
+    if (!Object.keys(diff).length) return { record: serialize_(cur), unchanged: true };
+
+    (REQUIRED_FIELDS[name] || []).forEach(function (f) {
+      if (cur[f] === '' || cur[f] === null || cur[f] === undefined) throw apiError_('VALIDATION', 'Нельзя очистить обязательное поле', { field: f });
+    });
+    if (name === 'Companies' && diff.name) cur.name_norm = normName_(cur.name);
+    if (opts.archive) { cur.deleted_at = new Date(); }
+    if (opts.restore) { cur.deleted_at = ''; }
+    cur.updated_at = new Date();
+    cur.rev = Number(cur.rev || 0) + 1;
+
+    writeRow_(t, cur);
+    invalidate_(name);
+    logActivity_(opts.actor || 'owner', opts.action || 'update', name, id, diff, '');
+    return { record: serialize_(cur) };
+  });
+}
+
+function dbArchive_(name, id, rev) {
+  return dbUpdate_(name, id, rev, { status: 'archived' }, { archive: true, action: 'archive' });
+}
+
+function dbRestore_(name, id, rev) {
+  return dbUpdate_(name, id, rev, { status: TABLES[name].statuses[0] }, { restore: true, action: 'restore' });
+}
+
+function appendObjects_(t, objs) {
+  var values = objs.map(function (o) { return t.headers.map(function (h) { return cellValue_(o[h]); }); });
+  var start = t.sheet.getLastRow() + 1;
+  t.sheet.getRange(start, 1, values.length, t.headers.length).setValues(values);
+}
+
+function writeRow_(t, obj) {
+  var row = t.headers.map(function (h) { return cellValue_(obj[h]); });
+  t.sheet.getRange(obj._row, 1, 1, t.headers.length).setValues([row]);
+}
+
+/** Строки, начинающиеся с = + - @, Sheets может принять за формулу. Апостроф делает их текстом. */
+function cellValue_(v) {
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string' && /^[=+\-@]/.test(v)) return "'" + v;
+  return v;
+}
+
+/* ======================= Валидация ======================= */
+
+function refCodes_() {
+  if (__refCodes) return __refCodes;
+  var sh = ss_().getSheetByName('ReferenceData');
+  var values = sh.getDataRange().getValues();
+  var h = values[0], iL = h.indexOf('list_name'), iC = h.indexOf('code'), iA = h.indexOf('active');
+  var out = {};
+  for (var r = 1; r < values.length; r++) {
+    if (values[r][iA] === false || String(values[r][iA]).toLowerCase() === 'false') continue;
+    var l = String(values[r][iL]);
+    (out[l] = out[l] || {})[String(values[r][iC])] = true;
+  }
+  __refCodes = out;
+  return out;
+}
+
+function sanitize_(name, input, partial) {
+  var fields = schemaFields_(name), out = {};
+  var def = TABLES[name];
+  fields.forEach(function (f) {
+    var key = f[0], type = String(f[1]);
+    if (!input.hasOwnProperty(key)) return;
+    if (SYSTEM_FIELDS.indexOf(key) !== -1) return;
+    var v = input[key];
+    if (v === null || v === undefined) v = '';
+    if (typeof v === 'string') v = v.trim();
+    if (v === '') { out[key] = ''; return; }
+
+    if (key === 'status') {
+      if (def.statuses.indexOf(v) === -1 && v !== 'archived') throw apiError_('VALIDATION', 'Недопустимый статус', { field: key, value: v });
+      out[key] = v; return;
+    }
+    out[key] = coerce_(key, type, v);
+  });
+  return out;
+}
+
+function coerce_(key, type, v) {
+  var fail = function (msg) { throw apiError_('VALIDATION', msg, { field: key, value: v }); };
+  if (type === 'number' || type === 'money' || type === 'percent') {
+    var n = typeof v === 'number' ? v : Number(String(v).replace(/\s/g, '').replace(',', '.'));
+    if (isNaN(n)) fail('Ожидается число');
+    return n;
+  }
+  if (type === 'date' || type === 'datetime') {
+    var d = v instanceof Date ? v : new Date(v);
+    if (isNaN(d.getTime())) fail('Неверная дата');
+    return d;
+  }
+  if (type === 'bool') return v === true || String(v).toLowerCase() === 'true';
+  if (type === 'email') {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v))) fail('Неверный email');
+    return String(v).toLowerCase();
+  }
+  if (type === 'json') return typeof v === 'string' ? v : JSON.stringify(v);
+
+  var m = type.match(/^(enum|multi):(.+)$/);
+  if (m) {
+    var allowed = refCodes_()[m[2]] || {};
+    var parts = m[1] === 'multi' ? String(v).split(',').map(function (s) { return s.trim(); }).filter(String) : [String(v)];
+    parts.forEach(function (p) { if (!allowed[p]) fail('Значения нет в справочнике ' + m[2]); });
+    return parts.join(',');
+  }
+  m = type.match(/^(ref|refs):(.+)$/);
+  if (m) {
+    var ids = m[1] === 'refs' ? String(v).split(',').map(function (s) { return s.trim(); }).filter(String) : [String(v)];
+    ids.forEach(function (id) { if (!findById_(m[2], id)) fail('Связанная запись не найдена в ' + m[2]); });
+    return ids.join(',');
+  }
+  return String(v).slice(0, 49000);
+}
+
+/* ======================= Дубли ======================= */
+
+function normName_(s) {
+  return String(s || '').toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[«»"'“”„`]/g, ' ')
+    .replace(/(^|\s)(тоо|ооо|ао|зао|оао|пао|ип|llp|llc|ltd|jsc|inc|gmbh)(?=\s|$|[.,])/g, ' ')
+    .replace(/[.,()]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function digits_(s) { return String(s || '').replace(/\D/g, ''); }
+
+function findDuplicate_(name, rec, t) {
+  var live = t.rows.filter(function (r) { return r.status !== 'archived' && !r.deleted_at; });
+  if (name === 'Companies') {
+    return live.filter(function (r) {
+      if (rec.tax_id && r.tax_id && String(r.tax_id).trim() === String(rec.tax_id).trim()) return true;
+      return r.name_norm && r.name_norm === rec.name_norm && String(r.country || '') === String(rec.country || '');
+    })[0] || null;
+  }
+  if (name === 'Contacts') {
+    return live.filter(function (r) {
+      if (rec.email && r.email && String(r.email).toLowerCase() === rec.email) return true;
+      var p1 = digits_(rec.phone), p2 = digits_(r.phone);
+      if (p1.length >= 10 && p2.length >= 10 && p1.slice(-10) === p2.slice(-10)) return true;
+      return rec.full_name && String(r.full_name).toLowerCase().trim() === String(rec.full_name).toLowerCase() &&
+             String(r.company_id || '') === String(rec.company_id || '');
+    })[0] || null;
+  }
+  if (name === 'Documents' && rec.drive_file_id) {
+    return live.filter(function (r) { return r.drive_file_id === rec.drive_file_id; })[0] || null;
+  }
+  return null;
+}
+
+/* ======================== Log ======================== */
+/**
+ * BD COMMAND CENTER — Log.gs
+ * Журнал действий. Только добавление строк. Вызывается внутри блокировки или сам её берёт.
+ */
+
+function logActivity_(actor, action, entityType, entityId, diff, note, isError) {
+  try {
+    var t = loadTable_('ActivityLog');
+    var now = new Date();
+    appendObjects_(t, [{
+      id: newId_('ACT'), created_at: now, updated_at: now,
+      status: isError ? 'error' : 'ok', owner: prop_('OWNER_EMAIL') || '', source: 'system', rev: 1,
+      actor: actor || 'system', action: action, entity_type: entityType || '', entity_id: entityId || '',
+      diff_json: diff ? JSON.stringify(diff).slice(0, 45000) : '', note: String(note || '').slice(0, 45000)
+    }]);
+    invalidate_('ActivityLog');
+  } catch (e) {
+    console.error('logActivity_ failed: ' + e);
+  }
+}
+
+function logError_(where, err) {
+  console.error(where + ': ' + (err && err.stack || err));
+  logActivity_('system', 'error', where, '', null, String(err && err.stack || err), true);
+}
+
+/* ======================== Auth ======================== */
+/**
+ * BD COMMAND CENTER — Auth.gs
+ * Вход одноразовым кодом, который приходит ТОЛЬКО на OWNER_EMAIL.
+ * В Script Properties хранится лишь SHA-256 хеш токена сессии.
+ */
+
+var SESSION_DAYS = 30;
+var CODE_TTL_SEC = 600;
+var CODE_MAX_TRIES = 5;
+var CODES_PER_HOUR = 5;
+
+function authRequestCode_() {
+  var cache = CacheService.getScriptCache();
+  var hourKey = 'auth:codes:' + Utilities.formatDate(new Date(), 'UTC', 'yyyyMMddHH');
+  var sent = Number(cache.get(hourKey) || 0);
+  if (sent >= CODES_PER_HOUR) throw apiError_('RATE_LIMIT', 'Слишком много запросов кода. Попробуйте через час.');
+
+  var hex = Utilities.getUuid().replace(/-/g, '').slice(0, 10);
+  var code = ('000000' + (parseInt(hex, 16) % 1000000)).slice(-6);
+  cache.put('auth:code', JSON.stringify({ h: sha256Hex_(code), tries: 0, exp: Date.now() + CODE_TTL_SEC * 1000 }), CODE_TTL_SEC);
+  cache.put(hourKey, String(sent + 1), 3600);
+
+  var owner = ownerEmail_();
+  MailApp.sendEmail({
+    to: owner,
+    subject: 'BD Command Center: код входа ' + code,
+    body: 'Код входа: ' + code + '\n\nДействует 10 минут. Если вы не запрашивали код, просто проигнорируйте письмо: без кода войти нельзя.',
+    htmlBody: '<div style="font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#111">' +
+      '<p style="margin:0 0 8px">Код входа в BD Command Center:</p>' +
+      '<p style="font-size:32px;letter-spacing:6px;font-weight:600;margin:0 0 16px">' + code + '</p>' +
+      '<p style="color:#666;margin:0">Действует 10 минут. Если вы не запрашивали код, проигнорируйте письмо.</p></div>'
+  });
+  logActivity_('system', 'login_code', 'Auth', '', null, 'Код отправлен');
+  return { sentTo: maskEmail_(owner), ttlSec: CODE_TTL_SEC };
+}
+
+function authVerify_(code, device) {
+  var cache = CacheService.getScriptCache();
+  var raw = cache.get('auth:code');
+  if (!raw) throw apiError_('CODE_EXPIRED', 'Код истёк или не запрашивался. Запросите новый.');
+  var st = JSON.parse(raw);
+  if (Date.now() > st.exp) { cache.remove('auth:code'); throw apiError_('CODE_EXPIRED', 'Код истёк. Запросите новый.'); }
+  if (st.tries >= CODE_MAX_TRIES) { cache.remove('auth:code'); throw apiError_('CODE_LOCKED', 'Слишком много попыток. Запросите новый код.'); }
+
+  if (sha256Hex_(String(code || '').replace(/\D/g, '')) !== st.h) {
+    st.tries++;
+    var left = Math.max(1, Math.round((st.exp - Date.now()) / 1000));
+    cache.put('auth:code', JSON.stringify(st), left);
+    throw apiError_('CODE_INVALID', 'Неверный код. Осталось попыток: ' + (CODE_MAX_TRIES - st.tries));
+  }
+  cache.remove('auth:code');
+
+  var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  var now = Date.now();
+  var session = { exp: now + SESSION_DAYS * 86400000, created: now, device: String(device || 'Устройство').slice(0, 60) };
+  PropertiesService.getScriptProperties().setProperty('SESS_' + sha256Hex_(token), JSON.stringify(session));
+  logActivity_('owner', 'login', 'Auth', '', null, 'Вход: ' + session.device);
+  return { token: token, expiresAt: new Date(session.exp).toISOString(), owner: maskEmail_(ownerEmail_()) };
+}
+
+function authCheck_(token) {
+  if (!token) throw apiError_('AUTH_REQUIRED', 'Нужен вход');
+  var props = PropertiesService.getScriptProperties();
+  var key = 'SESS_' + sha256Hex_(token);
+  var raw = props.getProperty(key);
+  if (!raw) throw apiError_('AUTH_REQUIRED', 'Сессия не найдена. Войдите заново.');
+  var s = JSON.parse(raw);
+  if (Date.now() > s.exp) { props.deleteProperty(key); throw apiError_('AUTH_REQUIRED', 'Сессия истекла. Войдите заново.'); }
+  s.key = key;
+  return s;
+}
+
+function authLogout_(session) {
+  PropertiesService.getScriptProperties().deleteProperty(session.key);
+  logActivity_('owner', 'logout', 'Auth', '', null, session.device);
+  return { done: true };
+}
+
+function authLogoutAll_() {
+  var props = PropertiesService.getScriptProperties();
+  var keys = props.getKeys().filter(function (k) { return k.indexOf('SESS_') === 0; });
+  keys.forEach(function (k) { props.deleteProperty(k); });
+  logActivity_('owner', 'logout_all', 'Auth', '', null, 'Сессий закрыто: ' + keys.length);
+  return { closed: keys.length };
+}
+
+function authSessions_(current) {
+  var props = PropertiesService.getScriptProperties().getProperties();
+  return {
+    sessions: Object.keys(props).filter(function (k) { return k.indexOf('SESS_') === 0; }).map(function (k) {
+      var s = JSON.parse(props[k]);
+      return { device: s.device, created: new Date(s.created).toISOString(), expires: new Date(s.exp).toISOString(), current: k === current.key };
+    })
+  };
+}
+
+function maskEmail_(e) {
+  var p = String(e).split('@');
+  return p[0].slice(0, 2) + '•••@' + p[1];
+}
+
+/* ======================== Api ======================== */
+/**
+ * BD COMMAND CENTER — Api.gs
+ * Единая точка входа для приложения. Запрос: POST, тело JSON
+ *   { action: 'records.list', token: '...', payload: {...} }
+ * Ответ: { ok: true, data } или { ok: false, error: { code, message, details } }
+ */
+
+function doGet() {
+  return json_({ ok: true, data: { service: 'BD COMMAND CENTER API', version: API_VERSION } });
+}
+
+function doPost(e) {
+  var req;
+  try {
+    req = JSON.parse(e && e.postData && e.postData.contents || '{}');
+  } catch (err) {
+    return json_({ ok: false, error: { code: 'BAD_REQUEST', message: 'Неверный JSON' } });
+  }
+  return json_(handle_(req));
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function handle_(req) {
+  var t0 = Date.now();
+  var action = String(req.action || '');
+  var p = req.payload || {};
+  try {
+    var data;
+    if (action === 'auth.requestCode') data = authRequestCode_();
+    else if (action === 'auth.verify') data = authVerify_(p.code, p.device);
+    else {
+      var session = authCheck_(req.token);
+      switch (action) {
+        case 'meta.get':        data = metaGet_(); break;
+        case 'records.list':    data = dbList_(p.table, p); break;
+        case 'records.get':     data = dbGet_(p.table, p.id); break;
+        case 'records.create':  data = dbCreate_(p.table, p.data, { force: !!p.force }); break;
+        case 'records.update':  data = dbUpdate_(p.table, p.id, p.rev, p.data); break;
+        case 'records.archive': data = dbArchive_(p.table, p.id, p.rev); break;
+        case 'records.restore': data = dbRestore_(p.table, p.id, p.rev); break;
+        case 'search.global':   data = dbSearch_(p.q); break;
+        case 'auth.sessions':   data = authSessions_(session); break;
+        case 'auth.logout':     data = authLogout_(session); break;
+        case 'auth.logoutAll':  data = authLogoutAll_(); break;
+        default: throw apiError_('UNKNOWN_ACTION', 'Неизвестное действие: ' + action);
+      }
+    }
+    return { ok: true, data: data, ms: Date.now() - t0 };
+  } catch (err) {
+    if (err && err.isApiError) {
+      return { ok: false, error: { code: err.code, message: err.message, details: err.details }, ms: Date.now() - t0 };
+    }
+    logError_('api:' + action, err);
+    return { ok: false, error: { code: 'SERVER_ERROR', message: 'Внутренняя ошибка сервера. Подробности в журнале (ActivityLog).' }, ms: Date.now() - t0 };
+  }
+}
+
+/** Всё, что приложению нужно знать о структуре: таблицы, поля, справочники, направления. */
+function metaGet_() {
+  var schema = {};
+  Object.keys(TABLES).forEach(function (name) {
+    var t = TABLES[name];
+    if (t.group === 'system') return;
+    schema[name] = {
+      prefix: t.prefix, group: t.group, desc: t.desc, statuses: t.statuses,
+      required: REQUIRED_FIELDS[name] || [],
+      fields: schemaFields_(name).map(function (f) { return { name: f[0], type: f[1], desc: f[2] }; })
+    };
+  });
+
+  var refSheet = ss_().getSheetByName('ReferenceData').getDataRange().getValues();
+  var h = refSheet[0], reference = {};
+  for (var r = 1; r < refSheet.length; r++) {
+    var row = {};
+    h.forEach(function (k, i) { row[k] = refSheet[r][i]; });
+    if (row.active === false || String(row.active).toLowerCase() === 'false') continue;
+    (reference[row.list_name] = reference[row.list_name] || []).push({
+      code: String(row.code), label: String(row.label_ru || row.code), direction: String(row.direction || ''), order: Number(row.sort_order) || 0
+    });
+  }
+  Object.keys(reference).forEach(function (k) { reference[k].sort(function (a, b) { return a.order - b.order; }); });
+
+  return {
+    apiVersion: API_VERSION,
+    owner: maskEmail_(ownerEmail_()),
+    directions: DIRECTIONS.map(function (d) { return { code: d.code, name: d.name, prefix: d.prefix, color: d.color }; }),
+    schema: schema,
+    reference: reference,
+    settings: { timezone: setting_('timezone', 'Asia/Almaty'), currency: setting_('ui.default_currency', 'KZT'), theme: setting_('ui.theme', 'auto') }
+  };
+}
